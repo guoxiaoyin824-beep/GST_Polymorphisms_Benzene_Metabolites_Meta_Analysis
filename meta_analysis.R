@@ -10,64 +10,48 @@
 # Positive SMD means a higher biomarker concentration in the
 # first genotype named in the comparison.
 # ============================================================
-
-# Install once if needed:
-# install.packages(c("meta", "readxl"))
-
+ 
 required_packages <- c("meta", "readxl")
 missing_packages <- required_packages[
   !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
 ]
 if (length(missing_packages) > 0) {
-  stop(
-    "Please install the missing package(s) first: ",
-    paste(missing_packages, collapse = ", "),
-    "\nRun: install.packages(c(\"meta\", \"readxl\"))"
-  )
+  stop("Please install: ", paste(missing_packages, collapse = ", "))
 }
 
 library(meta)
 library(readxl)
 
-# ---------- 1. Paths and analysis settings ----------
-# Change this path to your edited workbook. If it is not found,
-# R will open a file-selection window.
-data_file <- "D:/科研/meta/benzene/biomarkers.xlsx"
+# ---------- 1. Paths and settings ----------
+data_file <- paste0(
+  "/Users/roseguo/Desktop/科研/课题6_Benzene/step7_datatable/",
+  "meta_analysis_data_2.xlsx"
+)
 
 if (!file.exists(data_file)) {
-  message("Excel file not found. Please choose the biomarkers workbook manually.")
+  if (!interactive()) stop("data_file not found: ", data_file)
+  message("Excel file not found. Please choose manually.")
   data_file <- file.choose()
 }
 
-base_dir <- dirname(data_file)
-output_root <- file.path(base_dir, "SMD_meta_results")
+base_dir <- dirname(dirname(data_file))
+output_root <- file.path(base_dir, "gxy_new result")
 dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
 
-# If both All subjects and smoker/non-smoker strata are present for the same
-# article, use the two non-overlapping strata and remove the overlapping total.
-# Set FALSE if you prefer the overall row instead (then remove strata manually).
 prefer_smoking_strata <- TRUE
-
-# Same decision rule as the reference script:
-# heterogeneity P < 0.10 -> random-effects result; otherwise common-effect result.
 heterogeneity_cutoff <- 0.10
-
-# Random-effects settings. REML estimates tau^2; Hartung-Knapp is used for
-# the random-effects confidence interval.
 tau_method <- "REML"
 random_ci_method <- "HK"
-
-# Width used for every forest plot PDF (overall, Region subgroup,
-# and leave-one-out sensitivity plots).
+hk_min_k <- 2
+sample_size_cutoff <- 100
 forest_pdf_width <- 20
 
 expected_sheets <- c(
   "GSTM1_SPMA", "GSTM1_ttMA",
-  "GSTT1_SPMA", "GSTT1_ttMA",
-  "GSTP1_SPMA", "GSTP1_ttMA"
+  "GSTT1_SPMA", "GSTT1_ttMA"
 )
 
-# ---------- 2. General helper functions ----------
+# ---------- 2. Helpers ----------
 fill_down <- function(x) {
   x <- as.character(x)
   for (i in seq_along(x)) {
@@ -76,43 +60,34 @@ fill_down <- function(x) {
   x
 }
 
-num_clean <- function(x) {
-  suppressWarnings(as.numeric(trimws(as.character(x))))
-}
+num_clean <- function(x) suppressWarnings(as.numeric(trimws(as.character(x))))
 
 clean_column_names <- function(x) {
   x <- gsub("[^A-Za-z0-9]+", "_", x)
-  x <- gsub("^_+|_+$", "", x)
-  x
+  gsub("^_+|_+$", "", x)
 }
 
-format_year <- function(x) {
-  sub("\\.0$", "", trimws(as.character(x)))
-}
+format_year <- function(x) sub("\\.0$", "", trimws(as.character(x)))
 
 fmt_num <- function(x, digits = 2) {
   if (is.null(x) || length(x) == 0 || is.na(x)) return("")
   sprintf(paste0("%.", digits, "f"), x)
 }
-
 fmt_p <- function(p) {
   if (is.null(p) || length(p) == 0 || is.na(p)) return("")
   if (p < 0.001) return("<0.001")
   sprintf("%.3f", p)
 }
-
 fmt_p4 <- function(p) {
   if (is.null(p) || length(p) == 0 || is.na(p)) return("")
   if (p < 0.0001) return("<0.0001")
   sprintf("%.4f", p)
 }
-
 fmt_i2 <- function(x) {
   if (is.null(x) || length(x) == 0 || is.na(x)) return("")
   if (x <= 1) x <- x * 100
   sprintf("%.1f%%", x)
 }
-
 fmt_ci <- function(te, lower, upper) {
   if (any(is.na(c(te, lower, upper)))) return("")
   sprintf("%.2f (%.2f, %.2f)", te, lower, upper)
@@ -142,27 +117,42 @@ rbind_fill <- function(x, y) {
 safe_pdf <- function(file, expr, height = 7, width = 13) {
   pdf(file = file, height = height, width = width, onefile = TRUE)
   on.exit(dev.off(), add = TRUE)
-  tryCatch(
-    force(expr),
-    error = function(e) {
-      plot.new()
-      text(0.5, 0.5, paste("Plot error:", e$message), cex = 0.8)
-    }
-  )
+  force(expr)
 }
 
 make_study_label <- function(dat) {
-  base <- paste(dat$Author, dat$Year)
+  author <- trimws(as.character(dat$Author))
+  has_suffix <- grepl("^.+\\s*\\(.+\\)$", author)
+  author_base <- sub("\\s*\\((.*)\\)$", "", author)
+  author_suffix <- sub("^.+\\s*\\((.*)\\)$", "\\1", author)
+  base <- ifelse(
+    has_suffix,
+    paste0(author_base, " ", dat$Year, "(", author_suffix, ")"),
+    paste(author, dat$Year)
+  )
   stratum <- trimws(as.character(dat$Population_Stratum))
   show_stratum <- !is.na(stratum) & stratum != "" &
     !tolower(stratum) %in% c("all subjects", "overall", "total")
-  ifelse(show_stratum, paste0(base, "(", stratum, ")"), base)
+  ifelse(show_stratum & !has_suffix, paste0(base, "(", stratum, ")"), base)
 }
 
-# ---------- 3. Read and clean each worksheet ----------
+# ---------- 3. Read / clean ----------
 read_sheet_clean <- function(sheet_name) {
   dat <- as.data.frame(read_excel(data_file, sheet = sheet_name))
+  raw_names <- names(dat)
+  unit_index <- match(c("单位", "Unit", "unit"), raw_names, nomatch = 0L)
+  unit_index <- unit_index[unit_index > 0L][1]
+  unit_values <- if (length(unit_index) == 0L || is.na(unit_index)) {
+    rep(NA_character_, nrow(dat))
+  } else {
+    dat[[unit_index]]
+  }
   names(dat) <- clean_column_names(names(dat))
+  blank_names <- which(is.na(names(dat)) | names(dat) == "")
+  if (length(blank_names) > 0) {
+    names(dat)[blank_names] <- paste0("unnamed_", blank_names)
+  }
+  dat$Unit <- unit_values
 
   required_metadata <- c("Author", "Year", "Country", "Region")
   missing_metadata <- setdiff(required_metadata, names(dat))
@@ -173,10 +163,8 @@ read_sheet_clean <- function(sheet_name) {
   if (!"Population_Stratum" %in% names(dat)) dat$Population_Stratum <- "All subjects"
 
   fill_cols <- intersect(
-    c(
-      "Author", "Year", "Country", "Region", "Ethnicity",
-      "Detecting_method", "Source", "Population_Stratum", "Unit"
-    ),
+    c("Author", "Year", "Country", "Region", "Ethnicity",
+      "Detecting_method", "Source", "Population_Stratum", "Unit"),
     names(dat)
   )
   for (cc in fill_cols) dat[[cc]] <- fill_down(dat[[cc]])
@@ -186,6 +174,8 @@ read_sheet_clean <- function(sheet_name) {
   dat$Region <- trimws(as.character(dat$Region))
   dat$Region[is.na(dat$Region) | dat$Region == ""] <- "Not reported"
   dat$Population_Stratum <- trimws(as.character(dat$Population_Stratum))
+  dat$Unit <- trimws(as.character(dat$Unit))
+  dat$Unit[is.na(dat$Unit) | dat$Unit == ""] <- "Not reported"
 
   dat
 }
@@ -212,11 +202,15 @@ split_overlapping_totals <- function(dat) {
   }
   included <- dat[!drop, , drop = FALSE]
   excluded <- dat[drop, , drop = FALSE]
-  excluded$Exclusion_reason <- "Overlapping overall row removed because smoking strata were used"
+  # 修复：用 rep(..., nrow(excluded)) 保持行数一致
+  excluded$Exclusion_reason <- rep(
+    "Overlapping overall row removed because smoking strata were used",
+    nrow(excluded)
+  )
   list(included = included, excluded = excluded)
 }
 
-# ---------- 4. Convert worksheets into two-group comparisons ----------
+# ---------- 4. Prepare comparisons ----------
 prepare_two_group <- function(dat, n_e, mean_e, sd_e, n_c, mean_c, sd_c,
                               experimental_label, control_label) {
   required <- c(n_e, mean_e, sd_e, n_c, mean_c, sd_c)
@@ -240,6 +234,7 @@ prepare_two_group <- function(dat, n_e, mean_e, sd_e, n_c, mean_c, sd_c,
     dat$n_e >= 2 & dat$n_c >= 2 & dat$sd_e > 0 & dat$sd_c > 0
 
   excluded <- dat[!valid, , drop = FALSE]
+  # 修复：0 行时也能安全赋值
   excluded$Exclusion_reason <- rep(
     "Incomplete n/mean/SD, n < 2, or SD <= 0",
     nrow(excluded)
@@ -254,112 +249,6 @@ prepare_two_group <- function(dat, n_e, mean_e, sd_e, n_c, mean_c, sd_c,
   list(included = included, excluded = excluded)
 }
 
-combine_two_groups <- function(n1, mean1, sd1, n2, mean2, sd2) {
-  n <- n1 + n2
-  mean <- (n1 * mean1 + n2 * mean2) / n
-  sd <- sqrt(
-    (
-      (n1 - 1) * sd1^2 + (n2 - 1) * sd2^2 +
-        n1 * (mean1 - mean)^2 + n2 * (mean2 - mean)^2
-    ) / (n - 1)
-  )
-  list(n = n, mean = mean, sd = sd)
-}
-
-prepare_gstp1_carrier <- function(dat) {
-  cols <- c(
-    "n_Ile_Ile", "Mean_Ile_Ile", "SD_Ile_Ile",
-    "n_Ile_Val", "Mean_Ile_Val", "SD_Ile_Val",
-    "n_Val_Val", "Mean_Val_Val", "SD_Val_Val"
-  )
-  missing_cols <- setdiff(cols, names(dat))
-  if (length(missing_cols) > 0) {
-    stop("Missing GSTP1 carrier columns: ", paste(missing_cols, collapse = ", "))
-  }
-  for (cc in cols) dat[[cc]] <- num_clean(dat[[cc]])
-
-  valid <- complete.cases(dat[, cols]) &
-    dat$n_Ile_Ile >= 2 & dat$n_Ile_Val >= 2 & dat$n_Val_Val >= 2 &
-    dat$SD_Ile_Ile > 0 & dat$SD_Ile_Val > 0 & dat$SD_Val_Val > 0
-
-  excluded <- dat[!valid, , drop = FALSE]
-  excluded$Exclusion_reason <- rep(
-    "Incomplete Ile/Val or Val/Val data for carrier pooling",
-    nrow(excluded)
-  )
-
-  dat <- dat[valid, , drop = FALSE]
-  if (nrow(dat) > 0) {
-    combined <- mapply(
-      combine_two_groups,
-      dat$n_Ile_Val, dat$Mean_Ile_Val, dat$SD_Ile_Val,
-      dat$n_Val_Val, dat$Mean_Val_Val, dat$SD_Val_Val,
-      SIMPLIFY = FALSE
-    )
-    dat$n_e <- dat$n_Ile_Ile
-    dat$mean_e <- dat$Mean_Ile_Ile
-    dat$sd_e <- dat$SD_Ile_Ile
-    dat$n_c <- vapply(combined, function(x) x$n, numeric(1))
-    dat$mean_c <- vapply(combined, function(x) x$mean, numeric(1))
-    dat$sd_c <- vapply(combined, function(x) x$sd, numeric(1))
-    dat$Experimental <- "Ile/Ile"
-    dat$Control <- "Ile/Val + Val/Val"
-    overlap_split <- split_overlapping_totals(dat)
-    dat <- overlap_split$included
-    excluded <- rbind_fill(excluded, overlap_split$excluded)
-    dat$Study <- make_study_label(dat)
-  }
-
-  list(included = dat, excluded = excluded)
-}
-
-prepare_gstp1_recessive <- function(dat) {
-  cols <- c(
-    "n_Ile_Ile", "Mean_Ile_Ile", "SD_Ile_Ile",
-    "n_Ile_Val", "Mean_Ile_Val", "SD_Ile_Val",
-    "n_Val_Val", "Mean_Val_Val", "SD_Val_Val"
-  )
-  missing_cols <- setdiff(cols, names(dat))
-  if (length(missing_cols) > 0) {
-    stop("Missing GSTP1 recessive-model columns: ", paste(missing_cols, collapse = ", "))
-  }
-  for (cc in cols) dat[[cc]] <- num_clean(dat[[cc]])
-
-  valid <- complete.cases(dat[, cols]) &
-    dat$n_Ile_Ile >= 2 & dat$n_Ile_Val >= 2 & dat$n_Val_Val >= 2 &
-    dat$SD_Ile_Ile > 0 & dat$SD_Ile_Val > 0 & dat$SD_Val_Val > 0
-
-  excluded <- dat[!valid, , drop = FALSE]
-  excluded$Exclusion_reason <- rep(
-    "Incomplete genotype data for recessive-model pooling",
-    nrow(excluded)
-  )
-
-  dat <- dat[valid, , drop = FALSE]
-  if (nrow(dat) > 0) {
-    combined <- mapply(
-      combine_two_groups,
-      dat$n_Ile_Ile, dat$Mean_Ile_Ile, dat$SD_Ile_Ile,
-      dat$n_Ile_Val, dat$Mean_Ile_Val, dat$SD_Ile_Val,
-      SIMPLIFY = FALSE
-    )
-    dat$n_e <- vapply(combined, function(x) x$n, numeric(1))
-    dat$mean_e <- vapply(combined, function(x) x$mean, numeric(1))
-    dat$sd_e <- vapply(combined, function(x) x$sd, numeric(1))
-    dat$n_c <- dat$n_Val_Val
-    dat$mean_c <- dat$Mean_Val_Val
-    dat$sd_c <- dat$SD_Val_Val
-    dat$Experimental <- "Ile/Ile + Ile/Val"
-    dat$Control <- "Val/Val"
-    overlap_split <- split_overlapping_totals(dat)
-    dat <- overlap_split$included
-    excluded <- rbind_fill(excluded, overlap_split$excluded)
-    dat$Study <- make_study_label(dat)
-  }
-
-  list(included = dat, excluded = excluded)
-}
-
 build_tasks <- function(sheet_name, raw_dat) {
   if (grepl("^(GSTM1|GSTT1)_", sheet_name)) {
     return(list(
@@ -371,52 +260,34 @@ build_tasks <- function(sheet_name, raw_dat) {
       )
     ))
   }
-
-  if (grepl("^GSTP1_", sheet_name)) {
-    return(list(
-      Heterozygote_IleIle_vs_IleVal = prepare_two_group(
-        raw_dat,
-        "n_Ile_Ile", "Mean_Ile_Ile", "SD_Ile_Ile",
-        "n_Ile_Val", "Mean_Ile_Val", "SD_Ile_Val",
-        "Ile/Ile", "Ile/Val"
-      ),
-      Homozygote_IleIle_vs_ValVal = prepare_two_group(
-        raw_dat,
-        "n_Ile_Ile", "Mean_Ile_Ile", "SD_Ile_Ile",
-        "n_Val_Val", "Mean_Val_Val", "SD_Val_Val",
-        "Ile/Ile", "Val/Val"
-      ),
-      Dominant_IleIle_vs_ValCarrier = prepare_gstp1_carrier(raw_dat),
-      Recessive_IleCarrier_vs_ValVal = prepare_gstp1_recessive(raw_dat)
-    ))
-  }
-
   list()
 }
 
-# ---------- 5. Meta-analysis and result extraction ----------
-make_meta <- function(dat, with_region = FALSE) {
+# ---------- 5. Meta-analysis ----------
+make_meta <- function(dat, with_subgroup = NULL, random_ci_override = NULL) {
   allow_random <- nrow(dat) >= 2
+  ci_method <- if (!is.null(random_ci_override)) {
+    random_ci_override
+  } else if (allow_random && nrow(dat) >= hk_min_k) {
+    random_ci_method
+  } else {
+    "classic"
+  }
+
   args <- list(
-    n.e = dat$n_e,
-    mean.e = dat$mean_e,
-    sd.e = dat$sd_e,
-    n.c = dat$n_c,
-    mean.c = dat$mean_c,
-    sd.c = dat$sd_c,
-    studlab = dat$Study,
-    data = dat,
-    sm = "SMD",
-    method.smd = "Hedges",
+    n.e = dat$n_e, mean.e = dat$mean_e, sd.e = dat$sd_e,
+    n.c = dat$n_c, mean.c = dat$mean_c, sd.c = dat$sd_c,
+    studlab = dat$Study, data = dat,
+    sm = "SMD", method.smd = "Hedges",
     method.tau = tau_method,
-    method.random.ci = if (allow_random) random_ci_method else "classic",
+    method.random.ci = ci_method,
     common = TRUE,
     random = allow_random,
     prediction = FALSE
   )
-  if (with_region) {
-    args$subgroup <- dat$Region
-    args$subgroup.name <- "Region"
+  if (!is.null(with_subgroup)) {
+    args$subgroup <- dat[[with_subgroup]]
+    args$subgroup.name <- with_subgroup
     args$test.subgroup.common <- TRUE
     args$test.subgroup.random <- TRUE
   }
@@ -439,11 +310,16 @@ extract_result <- function(m) {
   up_random <- get_first(m, c("upper.random"))
   p_random <- get_first(m, c("pval.random"))
 
-  use_random <- !is.na(ph) && ph < heterogeneity_cutoff && k >= 2
+  if (k >= 2 && is.na(ph)) {
+    warning("Heterogeneity p is NA; defaulting to common-effect.")
+  }
+
+  use_random <- !is.na(ph) && ph <= heterogeneity_cutoff && k >= 2
   if (use_random) {
     selected_ci <- fmt_ci(te_random, lo_random, up_random)
     selected_p <- fmt_p(p_random)
-    model_used <- paste0("Random (", tau_method, "+", random_ci_method, ")")
+    model_used <- paste0("Random (", tau_method, "+",
+                         ifelse(k >= hk_min_k, random_ci_method, "classic"), ")")
   } else {
     selected_ci <- fmt_ci(te_common, lo_common, up_common)
     selected_p <- fmt_p(p_common)
@@ -456,45 +332,61 @@ extract_result <- function(m) {
     P_common = fmt_p(p_common),
     SMD_random_95CI = fmt_ci(te_random, lo_random, up_random),
     P_random = fmt_p(p_random),
-    Ph = fmt_p(ph),
-    I2 = fmt_i2(i2),
-    Tau2 = fmt_num(tau2, 4),
+    Ph = fmt_p(ph), I2 = fmt_i2(i2), Tau2 = fmt_num(tau2, 4),
     Model_used = model_used,
-    SMD_95CI = selected_ci,
-    P = selected_p,
+    SMD_95CI = selected_ci, P = selected_p,
     stringsAsFactors = FALSE
   )
 }
 
-extract_region_results <- function(dat, m_subgroup) {
-  regions <- unique(dat$Region)
-  out <- do.call(
-    rbind,
-    lapply(regions, function(region_name) {
-      region_dat <- dat[dat$Region == region_name, , drop = FALSE]
-      region_meta <- make_meta(region_dat, with_region = FALSE)
-      data.frame(
-        Region = region_name,
-        extract_result(region_meta),
-        check.names = FALSE,
-        stringsAsFactors = FALSE
-      )
-    })
-  )
+extract_subgroup_results <- function(dat, subgroup_var, m_subgroup) {
+  groups <- unique(dat[[subgroup_var]])
+  out <- do.call(rbind, lapply(groups, function(g) {
+    sub_dat <- dat[dat[[subgroup_var]] == g, , drop = FALSE]
+    if (nrow(sub_dat) < 2) {
+      # 修复：单研究分支也带上 P_between_* 两列，避免 rbind 列错位
+      return(data.frame(
+        Group = as.character(g), K = nrow(sub_dat),
+        SMD_common_95CI = "", P_common = "",
+        SMD_random_95CI = "", P_random = "",
+        Ph = "", I2 = "", Tau2 = "",
+        Model_used = "Single study (not pooled)",
+        SMD_95CI = "", P = "",
+        P_between_common = "", P_between_random = "",
+        check.names = FALSE, stringsAsFactors = FALSE
+      ))
+    }
+            ci_method <- if (nrow(sub_dat) >= hk_min_k) random_ci_method else "classic"
+    m_g <- make_meta(
+      sub_dat,
+      with_subgroup = NULL,
+      random_ci_override = ci_method
+    )
+    data.frame(
+      Group = as.character(g),
+      extract_result(m_g),
+      P_between_common = "", P_between_random = "",
+      check.names = FALSE, stringsAsFactors = FALSE
+    )
+  }))
+  names(out)[names(out) == "Group"] <- subgroup_var
 
-  p_between_common <- get_first(
-    m_subgroup,
-    c("pval.Q.b.common", "pval.Q.b.fixed", "pval.Q.b")
-  )
+  p_between_common <- get_first(m_subgroup,
+    c("pval.Q.b.common", "pval.Q.b.fixed", "pval.Q.b"))
   p_between_random <- get_first(m_subgroup, c("pval.Q.b.random"))
-  out$P_between_regions_common <- fmt_p(p_between_common)
-  out$P_between_regions_random <- fmt_p(p_between_random)
+  out$P_between_common <- fmt_p(p_between_common)
+  out$P_between_random <- fmt_p(p_between_random)
   out
+}
+
+extract_region_results <- function(dat, m_subgroup) {
+  extract_subgroup_results(dat, "Region", m_subgroup)
 }
 
 get_bias_p <- function(m, method_bias) {
   b <- tryCatch(
-    metabias(m, method.bias = method_bias, correct = TRUE, k.min = 3),
+    metabias(m, method.bias = method_bias,
+             correct = (method_bias == "Begg"), k.min = 3),
     error = function(e) NULL
   )
   if (is.null(b)) return(NA_real_)
@@ -512,9 +404,22 @@ extract_publication_bias <- function(m) {
   )
 }
 
+# 修复：失败时返回带列名的 0 行 data.frame，避免 rbind/write 出问题
+empty_sensitivity <- function() {
+  data.frame(
+    Removed_dataset = character(0),
+    SMD_95CI = character(0),
+    P = character(0),
+    Model = character(0),
+    stringsAsFactors = FALSE
+  )
+}
+
 extract_sensitivity <- function(m, pooled_model) {
   inf <- tryCatch(metainf(m, pooled = pooled_model), error = function(e) NULL)
-  if (is.null(inf)) return(data.frame())
+  if (is.null(inf) || is.null(inf$studlab) || length(inf$studlab) == 0) {
+    return(empty_sensitivity())
+  }
   data.frame(
     Removed_dataset = inf$studlab,
     SMD_95CI = sprintf("%.2f (%.2f, %.2f)", inf$TE, inf$lower, inf$upper),
@@ -524,32 +429,25 @@ extract_sensitivity <- function(m, pooled_model) {
   )
 }
 
-# ---------- 6. Plotting ----------
+# ---------- 6. Plot ----------
 forest_style <- function(m, experimental_label, control_label,
                          year_sort, subgroup_plot = FALSE) {
   forest(
     m,
-    common = TRUE,
-    random = TRUE,
-    prediction = FALSE,
-    overall = TRUE,
-    overall.hetstat = TRUE,
+    common = TRUE, random = TRUE, prediction = FALSE,
+    overall = TRUE, overall.hetstat = TRUE,
     sortvar = year_sort,
     leftcols = c("studlab", "n.e", "mean.e", "sd.e", "n.c", "mean.c", "sd.c"),
-    leftlabs = c("Dataset", experimental_label, "Mean", "SD", control_label, "Mean", "SD"),
+    leftlabs = c("Dataset", experimental_label, "Mean", "SD",
+                  control_label, "Mean", "SD"),
     rightcols = c("effect", "ci", "w.common", "w.random"),
     rightlabs = c("SMD", "95% CI", "Weight (common)", "Weight (random)"),
     smlab = "Hedges' g (SMD)",
-    xlab = paste0(
-      "Hedges' g: ", experimental_label, " minus ", control_label,
-      "  (positive = higher in ", experimental_label, ")"
-    ),
-    digits = 2,
-    digits.I2 = 1,
-    col.square = "#2C7FB8",
-    col.square.lines = "#2C7FB8",
-    col.diamond = "#D95F0E",
-    col.diamond.lines = "#D95F0E",
+    xlab = paste0("Hedges' g: ", experimental_label, " minus ", control_label,
+                  "  (positive = higher in ", experimental_label, ")"),
+    digits = 2, digits.I2 = 1,
+    col.square = "#2C7FB8", col.square.lines = "#2C7FB8",
+    col.diamond = "#D95F0E", col.diamond.lines = "#D95F0E",
     col.predict = "#636363",
     print.subgroup.name = subgroup_plot,
     test.subgroup = subgroup_plot
@@ -565,58 +463,60 @@ plot_analysis <- function(dat, m, m_region, fig_dir, prefix) {
   year_sort[is.na(year_sort)] <- Inf
 
   safe_pdf(file.path(fig_dir, paste0(prefix, "_overall_forest.PDF")), {
-    forest_style(
-      m, experimental_label, control_label,
-      year_sort = year_sort, subgroup_plot = FALSE
-    )
+    forest_style(m, experimental_label, control_label, year_sort, FALSE)
   }, height = forest_height, width = forest_pdf_width)
 
   safe_pdf(file.path(fig_dir, paste0(prefix, "_region_subgroup_forest.PDF")), {
-    forest_style(
-      m_region, experimental_label, control_label,
-      year_sort = year_sort, subgroup_plot = TRUE
-    )
+    forest_style(m_region, experimental_label, control_label, year_sort, TRUE)
   }, height = region_height, width = forest_pdf_width)
 
   if (nrow(dat) >= 3) {
     safe_pdf(file.path(fig_dir, paste0(prefix, "_sensitivity_common.PDF")), {
       forest(metainf(m, pooled = "common"), smlab = "Leave-one-out: common effect")
     }, height = forest_height, width = forest_pdf_width)
-
     safe_pdf(file.path(fig_dir, paste0(prefix, "_sensitivity_random.PDF")), {
       forest(metainf(m, pooled = "random"), smlab = "Leave-one-out: random effects")
     }, height = forest_height, width = forest_pdf_width)
   }
-
   if (nrow(dat) >= 2) {
     safe_pdf(file.path(fig_dir, paste0(prefix, "_funnel.PDF")), {
       funnel(m, pch = 21, xlab = "Hedges' g", studlab = TRUE)
     }, height = 6, width = 6)
-
     safe_pdf(file.path(fig_dir, paste0(prefix, "_galbraith_name.PDF")), {
       radial(m, text = dat$Study, level = 0.95)
     }, height = 7, width = 7)
-
     safe_pdf(file.path(fig_dir, paste0(prefix, "_galbraith_point.PDF")), {
       radial(m, pch = 19, level = 0.95)
     }, height = 7, width = 7)
   }
 }
 
-# ---------- 7. Run all worksheets and comparisons ----------
+plot_subgroup <- function(dat, m_subgroup, subgroup_var, fig_dir, prefix,
+                          experimental_label, control_label, year_sort,
+                          height_mult = 0.75) {
+  height <- max(8, 5 + height_mult * nrow(dat))
+  safe_pdf(file.path(fig_dir, paste0(prefix, "_", subgroup_var, "_subgroup_forest.PDF")), {
+    forest_style(m_subgroup, experimental_label, control_label,
+                  year_sort, subgroup_plot = TRUE)
+  }, height = height, width = forest_pdf_width)
+}
+
+# ---------- 7. Main loop ----------
 available_sheets <- excel_sheets(data_file)
 sheets_to_run <- intersect(expected_sheets, available_sheets)
 missing_sheets <- setdiff(expected_sheets, available_sheets)
 
 if (length(sheets_to_run) == 0) {
-  stop("None of the expected worksheets were found: ", paste(expected_sheets, collapse = ", "))
+  stop("None of the expected worksheets were found.")
 }
 if (length(missing_sheets) > 0) {
-  warning("These worksheets were not found and will be skipped: ", paste(missing_sheets, collapse = ", "))
+  warning("Missing worksheets skipped: ", paste(missing_sheets, collapse = ", "))
 }
 
 master_overall <- list()
 master_region <- list()
+master_unit <- list()
+master_size <- list()
 
 for (sheet_name in sheets_to_run) {
   message("Reading sheet: ", sheet_name)
@@ -637,38 +537,49 @@ for (sheet_name in sheets_to_run) {
     write_csv_safe(task$excluded, file.path(res_dir, "excluded_rows.csv"))
 
     if (nrow(dat) < 2) {
-      warning(sheet_name, " / ", comparison_name, ": fewer than 2 valid datasets; skipped.")
+      warning(sheet_name, " / ", comparison_name, ": <2 valid datasets; skipped.")
       next
     }
 
-    m <- make_meta(dat, with_region = FALSE)
-    m_region <- make_meta(dat, with_region = TRUE)
+    dat$Total_N <- dat$n_e + dat$n_c
+    dat$SampleSizeGroup <- ifelse(
+      dat$Total_N < sample_size_cutoff,
+      paste0("<", sample_size_cutoff),
+      paste0(">=", sample_size_cutoff)
+    )
+    dat$SampleSizeGroup <- factor(
+      dat$SampleSizeGroup,
+      levels = c(paste0("<", sample_size_cutoff), paste0(">=", sample_size_cutoff))
+    )
+
+    experimental_label <- unique(dat$Experimental)[1]
+    control_label <- unique(dat$Control)[1]
+    year_sort <- suppressWarnings(as.numeric(dat$Year))
+    year_sort[is.na(year_sort)] <- Inf
+
+    # A. 总体
+    m <- make_meta(dat, with_subgroup = NULL)
+    m_region <- make_meta(dat, with_subgroup = "Region")
 
     overall <- data.frame(
-      Sheet = sheet_name,
-      Comparison = comparison_name,
-      Direction = paste0(unique(dat$Experimental)[1], " minus ", unique(dat$Control)[1]),
-      extract_result(m),
-      check.names = FALSE,
-      stringsAsFactors = FALSE
+      Sheet = sheet_name, Comparison = comparison_name,
+      Direction = paste0(experimental_label, " minus ", control_label),
+      extract_result(m), check.names = FALSE, stringsAsFactors = FALSE
     )
     region <- data.frame(
-      Sheet = sheet_name,
-      Comparison = comparison_name,
+      Sheet = sheet_name, Comparison = comparison_name,
       extract_region_results(dat, m_region),
-      check.names = FALSE,
-      stringsAsFactors = FALSE
+      check.names = FALSE, stringsAsFactors = FALSE
     )
     bias <- data.frame(
-      Sheet = sheet_name,
-      Comparison = comparison_name,
+      Sheet = sheet_name, Comparison = comparison_name,
       extract_publication_bias(m),
-      check.names = FALSE,
-      stringsAsFactors = FALSE
+      check.names = FALSE, stringsAsFactors = FALSE
     )
-    sens_common <- extract_sensitivity(m, "common")
-    sens_random <- extract_sensitivity(m, "random")
-    sensitivity <- rbind(sens_common, sens_random)
+    sensitivity <- rbind(
+      extract_sensitivity(m, "common"),
+      extract_sensitivity(m, "random")
+    )
 
     write_csv_safe(overall, file.path(res_dir, "Table1_overall_results.csv"))
     write_csv_safe(region, file.path(res_dir, "Table2_region_subgroup_results.csv"))
@@ -680,23 +591,65 @@ for (sheet_name in sheets_to_run) {
 
     master_overall[[prefix]] <- overall
     master_region[[prefix]] <- region
-    message("Finished: ", sheet_name, " / ", comparison_name, "; datasets = ", nrow(dat))
+
+    # B. Unit 亚组
+    dat_unit <- dat[!is.na(dat$Unit) & trimws(as.character(dat$Unit)) != "", ,
+                    drop = FALSE]
+    if (nrow(dat_unit) >= 2 && length(unique(dat_unit$Unit)) >= 2) {
+      m_unit <- make_meta(dat_unit, with_subgroup = "Unit")
+      unit <- data.frame(
+        Sheet = sheet_name, Comparison = comparison_name,
+        extract_subgroup_results(dat_unit, "Unit", m_unit),
+        check.names = FALSE, stringsAsFactors = FALSE
+      )
+      write_csv_safe(unit, file.path(res_dir, "Table5_unit_subgroup_results.csv"))
+      year_sort_unit <- suppressWarnings(as.numeric(dat_unit$Year))
+      year_sort_unit[is.na(year_sort_unit)] <- Inf
+      plot_subgroup(dat_unit, m_unit, "Unit", fig_dir, prefix,
+                    experimental_label, control_label, year_sort_unit)
+      master_unit[[prefix]] <- unit
+    } else {
+      message(sheet_name, " / ", comparison_name,
+              ": Unit subgroup skipped (fewer than 2 units or 1 level).")
+    }
+
+    # C. Sample size 亚组
+    if (nrow(dat) >= 2 && length(unique(dat$SampleSizeGroup)) >= 2) {
+      m_size <- make_meta(dat, with_subgroup = "SampleSizeGroup")
+      size <- data.frame(
+        Sheet = sheet_name, Comparison = comparison_name,
+        extract_subgroup_results(dat, "SampleSizeGroup", m_size),
+        check.names = FALSE, stringsAsFactors = FALSE
+      )
+      write_csv_safe(size, file.path(res_dir, "Table6_sample_size_subgroup_results.csv"))
+      plot_subgroup(dat, m_size, "SampleSizeGroup", fig_dir, prefix,
+                    experimental_label, control_label, year_sort)
+      master_size[[prefix]] <- size
+    } else {
+      message(sheet_name, " / ", comparison_name,
+              ": Sample size subgroup skipped (only one size level).")
+    }
+
+    message("Finished: ", sheet_name, " / ", comparison_name,
+            "; datasets = ", nrow(dat))
   }
 }
 
 if (length(master_overall) > 0) {
-  write_csv_safe(
-    do.call(rbind, master_overall),
-    file.path(output_root, "ALL_overall_results.csv")
-  )
+  write_csv_safe(do.call(rbind, master_overall),
+                 file.path(output_root, "ALL_overall_results.csv"))
 }
 if (length(master_region) > 0) {
-  write_csv_safe(
-    do.call(rbind, master_region),
-    file.path(output_root, "ALL_region_subgroup_results.csv")
-  )
+  write_csv_safe(do.call(rbind, master_region),
+                 file.path(output_root, "ALL_region_subgroup_results.csv"))
+}
+if (length(master_unit) > 0) {
+  write_csv_safe(do.call(rbind, master_unit),
+                 file.path(output_root, "ALL_unit_subgroup_results.csv"))
+}
+if (length(master_size) > 0) {
+  write_csv_safe(do.call(rbind, master_size),
+                 file.path(output_root, "ALL_sample_size_subgroup_results.csv"))
 }
 
 message("All analyses completed. Results saved in: ", output_root)
-message("Effect measure: Hedges' g (SMD).")
-message("Region subgroup results are in ALL_region_subgroup_results.csv and each analysis folder.")
